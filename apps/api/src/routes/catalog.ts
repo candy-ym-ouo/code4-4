@@ -1,11 +1,26 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { locationInputSchema, sourceInputSchema } from "@handcraft/contracts";
+import {
+  sourceInputSchema,
+  locationInputSchema,
+  locationMoveSchema,
+  locationPatchSchema,
+  locationReorderSchema
+} from "@handcraft/contracts";
 import type { AuthenticatedRequest } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/db.js";
 import { AppError } from "../lib/errors.js";
 import { parseInput } from "../lib/validation.js";
 import { parsePagination, pageMeta } from "../lib/pagination.js";
 import { writeAudit } from "../lib/audit.js";
+import {
+  assertCanCreate,
+  assertCanRename,
+  loadLocationForUpdate,
+  lockLocationTree,
+  moveLocation,
+  nextSortOrder,
+  reorderLocations
+} from "../lib/locationTree.js";
 
 type Query = Record<string, string | undefined>;
 
@@ -134,12 +149,14 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
     const includeArchived = request.query.archived === "true";
     const result = await pool.query(
       `SELECT l.id, l.name, l.parent_id AS "parentId", l.notes, l.archived_at AS "archivedAt",
+              l.sort_order AS "sortOrder", l.version,
               l.created_at AS "createdAt", l.updated_at AS "updatedAt",
               count(b.id)::int AS "batchCount"
          FROM storage_locations l
          LEFT JOIN batches b ON b.location_id = l.id AND b.status <> 'ARCHIVED'
         WHERE ${includeArchived ? "l.archived_at IS NOT NULL" : "l.archived_at IS NULL"}
-        GROUP BY l.id ORDER BY l.name`
+        GROUP BY l.id
+        ORDER BY l.parent_id NULLS FIRST, l.sort_order, l.name`
     );
     return { data: result.rows };
   });
@@ -148,64 +165,142 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
     const input = parseInput(locationInputSchema, request.body);
     const user = (request as AuthenticatedRequest).authUser;
     const created = await withTransaction(async (client) => {
-      if (input.parentId) {
-        const parent = await client.query("SELECT id FROM storage_locations WHERE id = $1 AND archived_at IS NULL FOR SHARE", [input.parentId]);
-        if (!parent.rowCount) throw new AppError(422, "INVALID_PARENT", "上级位置不存在或已归档");
-      }
+      // 串行化结构变更，防止并发创建/移动造成的层级竞态
+      await lockLocationTree(client);
+      await assertCanCreate(client, input.parentId || null, input.name);
+      const sortOrder = await nextSortOrder(client, input.parentId || null);
       const result = await client.query(
-        `INSERT INTO storage_locations(name, parent_id, notes) VALUES ($1, $2, $3) RETURNING *`,
-        [input.name, input.parentId || null, input.notes || null]
+        `INSERT INTO storage_locations(name, parent_id, notes, sort_order)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, parent_id AS "parentId", notes, sort_order AS "sortOrder",
+                   version, archived_at AS "archivedAt", created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [input.name, input.parentId || null, input.notes || null, sortOrder]
       );
-      await writeAudit(client, { actorUserId: user.id, action: "CREATE", entityType: "LOCATION", entityId: result.rows[0]?.id, afterData: result.rows[0], requestId: request.id });
+      await writeAudit(client, {
+        actorUserId: user.id, action: "CREATE", entityType: "LOCATION", entityId: result.rows[0]?.id,
+        afterData: result.rows[0], requestId: request.id
+      });
       return result.rows[0];
     });
     return reply.status(201).send({ data: created });
   });
 
+  // 仅改名称/备注；层级调整走 /move，避免普通编辑里混入环风险
   app.patch<{ Params: { id: string } }>("/locations/:id", async (request) => {
-    const input = parseInput(locationInputSchema.partial(), request.body);
+    const input = parseInput(locationPatchSchema, request.body);
     const user = (request as AuthenticatedRequest).authUser;
     return withTransaction(async (client) => {
-      if (input.parentId === request.params.id) throw new AppError(422, "LOCATION_CYCLE", "位置不能作为自己的上级");
-      if (input.parentId) {
-        const parent = await client.query("SELECT id FROM storage_locations WHERE id = $1 AND archived_at IS NULL FOR SHARE", [input.parentId]);
-        if (!parent.rowCount) throw new AppError(422, "INVALID_PARENT", "上级位置不存在或已归档");
-        const cycle = await client.query(
-          `WITH RECURSIVE ancestors AS (
-             SELECT id, parent_id FROM storage_locations WHERE id = $1
-             UNION SELECT l.id, l.parent_id FROM storage_locations l JOIN ancestors a ON l.id = a.parent_id
-           ) SELECT id FROM ancestors WHERE id = $2`,
-          [input.parentId, request.params.id]
-        );
-        if (cycle.rowCount) throw new AppError(422, "LOCATION_CYCLE", "位置层级不能形成循环");
-      }
-      const before = await client.query("SELECT * FROM storage_locations WHERE id = $1 FOR UPDATE", [request.params.id]);
-      if (!before.rows[0]) throw new AppError(404, "NOT_FOUND", "位置不存在");
+      const old = await loadLocationForUpdate(client, request.params.id);
+      if (old.archived_at) throw new AppError(422, "LOCATION_ARCHIVED", "位置已归档，不能编辑");
+      const nextName = input.name ?? old.name;
+      await assertCanRename(client, old, nextName);
       const result = await client.query(
-        `UPDATE storage_locations SET name = coalesce($1, name),
-          parent_id = CASE WHEN $2::boolean THEN $3 ELSE parent_id END,
-          notes = CASE WHEN $4::boolean THEN $5 ELSE notes END
-         WHERE id = $6 RETURNING *`,
-        [input.name ?? null, "parentId" in input, input.parentId || null, "notes" in input, input.notes || null, request.params.id]
+        `UPDATE storage_locations SET
+          name = $2,
+          notes = CASE WHEN $3::boolean THEN $4 ELSE notes END,
+          version = version + 1
+         WHERE id = $1
+         RETURNING id, name, parent_id AS "parentId", notes, sort_order AS "sortOrder",
+                   version, archived_at AS "archivedAt", created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [
+          request.params.id,
+          nextName,
+          "notes" in input,
+          input.notes || null
+        ]
       );
-      await writeAudit(client, { actorUserId: user.id, action: "UPDATE", entityType: "LOCATION", entityId: request.params.id, beforeData: before.rows[0], afterData: result.rows[0], requestId: request.id });
+      await writeAudit(client, { actorUserId: user.id, action: "UPDATE", entityType: "LOCATION", entityId: request.params.id, beforeData: old, afterData: result.rows[0], requestId: request.id });
       return { data: result.rows[0] };
     });
+  });
+
+  // 库位树移动：在单事务内改 parent_id、压实新旧同级序号，失败整体回滚不留断链
+  app.post<{ Params: { id: string } }>("/locations/:id/move", async (request, reply) => {
+    const input = parseInput(locationMoveSchema, request.body);
+    const user = (request as AuthenticatedRequest).authUser;
+    const data = await withTransaction(async (client) => {
+      await lockLocationTree(client);
+      const before = await loadLocationForUpdate(client, request.params.id);
+      const { row, moved } = await moveLocation(
+        client,
+        request.params.id,
+        input.version,
+        input.parentId,
+        input.beforeId ?? null
+      );
+      if (moved) {
+        await writeAudit(client, {
+          actorUserId: user.id, action: "MOVE", entityType: "LOCATION", entityId: request.params.id,
+          beforeData: { parentId: before.parent_id, sortOrder: before.sort_order, version: before.version },
+          afterData: { parentId: row.parent_id, sortOrder: row.sort_order, version: row.version },
+          requestId: request.id
+        });
+      }
+      return row;
+    });
+    return reply.status(200).send({ data: serializeLocation(data) });
+  });
+
+  // 同一父级下的纯排序（不移动父子关系）
+  app.post("/locations/reorder", async (request) => {
+    const input = parseInput(locationReorderSchema, request.body);
+    const user = (request as AuthenticatedRequest).authUser;
+    await withTransaction(async (client) => {
+      await lockLocationTree(client);
+      const orderedIds = await reorderLocations(client, input.parentId, input.orderedIds);
+      await writeAudit(client, {
+        actorUserId: user.id, action: "REORDER", entityType: "LOCATION",
+        entityId: input.parentId, afterData: { parentId: input.parentId, orderedIds }, requestId: request.id
+      });
+    });
+    return { data: { parentId: input.parentId, orderedIds: input.orderedIds } };
   });
 
   app.post<{ Params: { id: string } }>("/locations/:id/archive", async (request) => {
     const user = (request as AuthenticatedRequest).authUser;
     return withTransaction(async (client) => {
-      const current = await client.query("SELECT id FROM storage_locations WHERE id = $1 FOR UPDATE", [request.params.id]);
-      if (!current.rows[0]) throw new AppError(404, "NOT_FOUND", "位置不存在");
+      await lockLocationTree(client);
+      await loadLocationForUpdate(client, request.params.id);
       const children = await client.query(
         "SELECT 1 FROM storage_locations WHERE parent_id = $1 AND archived_at IS NULL LIMIT 1",
         [request.params.id]
       );
-      if (children.rowCount) throw new AppError(409, "LOCATION_HAS_CHILDREN", "请先归档该位置下的子位置");
-      const result = await client.query("UPDATE storage_locations SET archived_at = now() WHERE id = $1 RETURNING *", [request.params.id]);
+      if (children.rowCount) throw new AppError(409, "LOCATION_HAS_CHILDREN", "请先归档或移走该位置下的子位置");
+      const result = await client.query(
+        "UPDATE storage_locations SET archived_at = now(), version = version + 1 WHERE id = $1 RETURNING *",
+        [request.params.id]
+      );
       await writeAudit(client, { actorUserId: user.id, action: "ARCHIVE", entityType: "LOCATION", entityId: request.params.id, afterData: result.rows[0], requestId: request.id });
-      return { data: result.rows[0] };
+      return { data: serializeLocation(result.rows[0]) };
     });
   });
+}
+
+function serializeLocation(row: Record<string, unknown> & {
+  id: string;
+  name: string;
+  parent_id?: string | null;
+  parentId?: string | null;
+  notes: string | null;
+  sort_order?: number;
+  sortOrder?: number;
+  version: number;
+  archived_at?: Date | null;
+  archivedAt?: Date | null;
+  created_at?: Date;
+  createdAt?: Date;
+  updated_at?: Date;
+  updatedAt?: Date;
+}) {
+  return {
+    id: row.id,
+    name: row.name,
+    parentId: row.parentId ?? row.parent_id ?? null,
+    notes: row.notes,
+    sortOrder: row.sortOrder ?? row.sort_order ?? 0,
+    version: row.version,
+    archivedAt: row.archivedAt ?? row.archived_at ?? null,
+    createdAt: row.createdAt ?? row.created_at ?? null,
+    updatedAt: row.updatedAt ?? row.updated_at ?? null
+  };
 }

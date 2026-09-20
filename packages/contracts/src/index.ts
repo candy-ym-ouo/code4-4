@@ -140,6 +140,26 @@ export const locationInputSchema = z.object({
   notes: z.string().trim().max(2000).nullable().optional()
 });
 
+export const locationPatchSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  notes: z.string().trim().max(2000).nullable().optional()
+}).refine((value) => Object.keys(value).length > 0, "至少提供一个可更新字段");
+
+export const locationMoveSchema = z.object({
+  // 必填：null 表示移动到顶级；不传或传 uuid 表示新上级
+  parentId: z.string().uuid().nullable(),
+  // 可选：移动后排在该同级之前；为 null 或省略时排到同级末尾
+  beforeId: z.string().uuid().nullable().optional(),
+  version: z.number().int().positive()
+});
+
+export const locationReorderSchema = z.object({
+  // 必填：父级 id；null 表示对顶级位置排序
+  parentId: z.string().uuid().nullable(),
+  // 必须给出该父级下全部未归档子位置，顺序即新顺序
+  orderedIds: z.array(z.string().uuid()).min(1)
+});
+
 export const materialInputSchema = z.object({
   code: z.string().trim().max(64).nullable().optional(),
   name: z.string().trim().min(1).max(120),

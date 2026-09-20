@@ -68,6 +68,8 @@ export type Location = {
   parentId: string | null;
   notes: string | null;
   batchCount: number;
+  sortOrder: number;
+  version: number;
   archivedAt: string | null;
 };
 

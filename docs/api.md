@@ -59,8 +59,38 @@
 | POST | `/sources/:id/archive` | 归档 |
 | POST | `/sources/:id/unarchive` | 取消归档 |
 | GET/POST | `/locations` | 查询或创建位置 |
-| PATCH | `/locations/:id` | 更新位置 |
+| PATCH | `/locations/:id` | 更新位置名称/备注（不改层级） |
+| POST | `/locations/:id/move` | 移动位置并指定同级顺序 |
+| POST | `/locations/reorder` | 对同一父级下的子位置整体排序 |
 | POST | `/locations/:id/archive` | 归档位置 |
+
+库位树以 `parentId` 构成层级，`sortOrder` 决定同一父级下的顺序（从 0 起压实），`GET /locations`
+按父级、`sortOrder`、名称返回扁平列表，由前端组装为树。移动与排序都在单事务内完成，
+失败整体回滚，不会留下断开的层级；移动节点时子孙节点和 `batches.locationId` 引用均保持不变。
+
+移动位置（`POST /locations/:id/move`）：
+
+```json
+{
+  "parentId": "目标上级 id；null 表示顶级，必填",
+  "beforeId": "移动后排在该同级之前；null 或省略表示排到末尾",
+  "version": 3
+}
+```
+
+- 服务端递归校验祖先链，把节点挂到自身或自己的子孙下返回 `422 LOCATION_CYCLE`。
+- `version` 与当前不一致（并发移动冲突）返回 `409 VERSION_CONFLICT`，拒绝一侧；
+  另一处结构调整正在进行时返回 `409 LOCATION_TREE_BUSY`。
+- 目标同级含同名位置返回 `422 LOCATION_NAME_CONFLICT`，参考位置无效返回 `422 INVALID_BEFORE`。
+
+同级排序（`POST /locations/reorder`）：
+
+```json
+{ "parentId": null, "orderedIds": ["uuid1", "uuid2"] }
+```
+
+`orderedIds` 必须是该父级下全部未归档子位置；与数据库集合不一致（并发创建、移动或归档后）
+返回 `409 LOCATION_REORDER_STALE`，需要刷新后重新排序。
 
 ## 4. 材料
 
